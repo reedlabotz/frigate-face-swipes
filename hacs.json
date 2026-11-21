@@ -1,5 +1,8 @@
 {
   "name": "Frigate Face Swipes",
   "render_readme": true,
-  "homeassistant": "2024.6.0"
+  "homeassistant": "2024.6.0",
+  "zip_release": true,
+  "filename": "frigate_face_swipes.zip",
+  "hide_default_branch": true
 }

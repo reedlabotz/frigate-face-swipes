@@ -5,3 +5,5 @@ __pycache__/
 .vscode/
 .idea/
 node_modules/
+custom_components/frigate_face_swipes/frontend/frigate-face-swipes-card.js
+frigate_face_swipes.zip
