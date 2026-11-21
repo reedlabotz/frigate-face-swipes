@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Frigate",
+        "description": "Enter your Frigate server URL so Home Assistant can proxy face recognition and training requests securely.",
+        "data": {
+          "frigate_url": "Frigate URL (e.g. http://ccab4aaf-frigate:5000 or http://192.168.1.10:5000)",
+          "username": "Frigate Username (optional, for port 8971 auth)",
+          "password": "Frigate Password (optional)",
+          "verify_ssl": "Verify SSL certificates",
+          "show_sidebar": "Add Face Swipes to Home Assistant sidebar"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach Frigate at that URL (check host, port, and auth).",
+      "invalid_auth": "Invalid Frigate username or password."
+    },
+    "abort": {
+      "already_configured": "This Frigate URL is already configured."
+    }
+  }
+}
