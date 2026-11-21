@@ -478,6 +478,12 @@ class FrigateFaceSwipesCard extends HTMLElement {
 
   handleKeyDown(e) {
     if (this._mode !== 'swipe' || !this._deck.length) return;
+    if (e.key === 'Escape' && this._showPicker) {
+      e.preventDefault();
+      this._showPicker = false;
+      this.render();
+      return;
+    }
     const active = this.shadowRoot?.activeElement;
     if (active && (active.tagName === 'INPUT' || active.tagName === 'SELECT')) return;
     if (e.key === 'ArrowRight') { e.preventDefault(); this.confirmCurrent(); }
@@ -784,40 +790,91 @@ class FrigateFaceSwipesCard extends HTMLElement {
         .act-btn.confirm { border-color: rgba(34,197,94,0.6); color: #4ade80; }
         .act-btn.reassign { border-color: rgba(59,130,246,0.6); color: #60a5fa; }
         .kbd-hint { font-size: 11px; color: var(--t-muted); text-align: center; }
+        .picker-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.6);
+          backdrop-filter: blur(5px);
+          z-index: 9999;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 16px;
+        }
         .picker {
           width: 100%;
-          max-width: 390px;
-          background: var(--t-surface);
+          max-width: 420px;
+          max-height: 84vh;
+          background: var(--t-bg);
           border: 1px solid var(--t-border);
-          border-radius: 16px;
-          padding: 12px;
+          border-radius: 20px;
+          padding: 16px;
+          box-shadow: 0 24px 56px rgba(0, 0, 0, 0.45);
           display: flex;
           flex-direction: column;
+          gap: 12px;
+        }
+        .picker-hdr {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
           gap: 10px;
+        }
+        .picker-title-wrap {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+        .picker-thumb {
+          width: 42px;
+          height: 42px;
+          border-radius: 10px;
+          object-fit: cover;
+          background: #0d0f13;
+          border: 1px solid var(--t-border);
+        }
+        .picker-close {
+          background: var(--t-surface);
+          color: var(--primary-text-color, #fff);
+          border: 1px solid var(--t-border);
+          border-radius: 999px;
+          padding: 5px 11px;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          font-family: inherit;
         }
         .picker-grid {
           display: grid;
-          grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+          grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
           gap: 8px;
+          max-height: 44vh;
+          overflow-y: auto;
+          padding-right: 2px;
         }
         .person-choice {
-          background: var(--t-bg);
+          background: var(--t-surface);
           border: 1px solid var(--t-border);
-          border-radius: 10px;
-          padding: 6px;
+          border-radius: 12px;
+          padding: 8px 6px;
           color: inherit;
           cursor: pointer;
           display: flex;
           flex-direction: column;
           align-items: center;
-          gap: 5px;
+          gap: 6px;
           font-size: 12px;
           font-weight: 600;
           font-family: inherit;
+          transition: transform 0.1s ease, border-color 0.1s ease;
+        }
+        .person-choice:hover {
+          transform: translateY(-1px);
+          border-color: #3b82f6;
         }
         .person-choice img {
-          width: 48px;
-          height: 48px;
+          width: 52px;
+          height: 52px;
           border-radius: 50%;
           object-fit: cover;
         }
@@ -1017,22 +1074,31 @@ class FrigateFaceSwipesCard extends HTMLElement {
         <div class="kbd-hint">Swipe or keys: ← Trash · → Add · R Replace weakest · ↑ Reassign · ↓ Skip · Z Undo</div>
 
         ${this._showPicker ? `
-          <div class="picker">
-            <strong style="font-size:13px;">Who is this?</strong>
-            <div class="picker-grid">
-              ${people.map(p => {
-                const firstImg = this._faces[p]?.[0];
-                return `
-                  <button class="person-choice" data-pick-person="${escapeHtml(p)}">
-                    ${firstImg ? `<img data-auth-img="clips/faces/${escapeHtml(p)}/${escapeHtml(firstImg)}" alt="${escapeHtml(p)}" />` : `<div style="width:48px;height:48px;border-radius:50%;background:var(--t-surface);"></div>`}
-                    <span>${escapeHtml(p)}</span>
-                  </button>
-                `;
-              }).join('')}
-            </div>
-            <div class="new-row">
-              <input type="text" id="new-person-input" placeholder="New person name..." style="flex:1;" />
-              <button class="btn primary" id="btn-new-person">Save</button>
+          <div class="picker-backdrop" id="picker-backdrop">
+            <div class="picker">
+              <div class="picker-hdr">
+                <div class="picker-title-wrap">
+                  <img class="picker-thumb" data-auth-img="clips/faces/train/${escapeHtml(top.filename)}" alt="Candidate" />
+                  <strong style="font-size:15px;">Who is this?</strong>
+                </div>
+                <button class="picker-close" id="picker-close">✕ Close</button>
+              </div>
+              <input type="text" id="picker-filter" placeholder="Filter people..." />
+              <div class="picker-grid" id="picker-grid">
+                ${people.map(p => {
+                  const firstImg = this._faces[p]?.[0];
+                  return `
+                    <button class="person-choice" data-pick-person="${escapeHtml(p)}">
+                      ${firstImg ? `<img data-auth-img="clips/faces/${escapeHtml(p)}/${escapeHtml(firstImg)}" alt="${escapeHtml(p)}" />` : `<div style="width:52px;height:52px;border-radius:50%;background:var(--t-bg);"></div>`}
+                      <span>${escapeHtml(p)}</span>
+                    </button>
+                  `;
+                }).join('')}
+              </div>
+              <div class="new-row">
+                <input type="text" id="new-person-input" placeholder="New person name..." style="flex:1;" />
+                <button class="btn primary" id="btn-new-person">Save</button>
+              </div>
             </div>
           </div>
         ` : ''}
@@ -1169,15 +1235,44 @@ class FrigateFaceSwipesCard extends HTMLElement {
       });
     });
 
+    root.getElementById('picker-close')?.addEventListener('click', () => {
+      this._showPicker = false;
+      this.render();
+    });
+    const pickerBackdrop = root.getElementById('picker-backdrop');
+    if (pickerBackdrop) {
+      pickerBackdrop.addEventListener('click', (e) => {
+        if (e.target === pickerBackdrop) {
+          this._showPicker = false;
+          this.render();
+        }
+      });
+    }
+    root.getElementById('picker-filter')?.addEventListener('input', (e) => {
+      const q = e.target.value.trim().toLowerCase();
+      root.querySelectorAll('#picker-grid .person-choice').forEach(btn => {
+        const name = (btn.dataset.pickPerson || '').toLowerCase();
+        btn.style.display = !q || name.includes(q) ? '' : 'none';
+      });
+    });
+
     root.querySelectorAll('button[data-pick-person]').forEach(btn => {
       btn.addEventListener('click', () => {
         if (top) this.classifyItem(top, btn.dataset.pickPerson, 'reassigned');
       });
     });
 
-    root.getElementById('btn-new-person')?.addEventListener('click', () => {
-      const val = root.getElementById('new-person-input')?.value?.trim();
+    const newPersonInput = root.getElementById('new-person-input');
+    const submitNewPerson = () => {
+      const val = newPersonInput?.value?.trim();
       if (val && top) this.classifyItem(top, val, 'reassigned');
+    };
+    root.getElementById('btn-new-person')?.addEventListener('click', submitNewPerson);
+    newPersonInput?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitNewPerson();
+      }
     });
 
     const activeCard = root.getElementById('active-card');
