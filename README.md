@@ -2,6 +2,12 @@
 
 A Home Assistant custom integration & Lit/TypeScript Lovelace card/panel for **Tinder-style** and **Google Photos-style** face assignment and curation with **Frigate** (0.16+).
 
+## Screenshots
+
+| Swipe Mode (Assign Names) | Who Is This? Popover | Curate Mode (Best-N Diverse) |
+| :---: | :---: | :---: |
+| ![Swipe Mode](docs/screenshots/swipe-mode.png) | ![Reassign Modal](docs/screenshots/reassign-modal.png) | ![Curate Mode](docs/screenshots/curate-mode.png) |
+
 ## Features
 
 - **Swipe Mode (Assign Names):**
@@ -34,6 +40,7 @@ The frontend is built with **TypeScript**, **Lit**, and **Vite** (`src/` → `cu
 
 ```bash
 npm install
-npm run build      # Typecheck (tsc --noEmit) and bundle with Vite
-npm run dev        # Watch mode
+npm run build        # Typecheck (tsc --noEmit) and bundle with Vite
+npm run dev          # Watch mode
+npm run screenshots  # Regenerate docs/screenshots/*.png using emoji sample faces
 ```
