@@ -106,11 +106,101 @@ async function analyzeFaceQuality(blob) {
   if (meanLum < 45) flags.push('Dark');
   if (!flags.length) flags.push(`${minDim}px`);
 
+  // Compute 16x16 normalized RGB descriptor (768 dims) for diversity comparison
+  const dSize = 16;
+  const dCanvas = document.createElement('canvas');
+  dCanvas.width = dSize;
+  dCanvas.height = dSize;
+  const dCtx = dCanvas.getContext('2d');
+  dCtx.drawImage(canvas, 0, 0, dSize, dSize);
+  const dData = dCtx.getImageData(0, 0, dSize, dSize).data;
+  const desc = new Float32Array(dSize * dSize * 3);
+  let dMean = 0;
+  for (let i = 0; i < dSize * dSize; i++) {
+    desc[i * 3] = dData[i * 4];
+    desc[i * 3 + 1] = dData[i * 4 + 1];
+    desc[i * 3 + 2] = dData[i * 4 + 2];
+    dMean += desc[i * 3] + desc[i * 3 + 1] + desc[i * 3 + 2];
+  }
+  dMean /= desc.length;
+  let normSq = 0;
+  for (let i = 0; i < desc.length; i++) {
+    desc[i] -= dMean;
+    normSq += desc[i] * desc[i];
+  }
+  const norm = Math.sqrt(normSq) || 1;
+  for (let i = 0; i < desc.length; i++) desc[i] /= norm;
+
   return {
     score: total,
     width: origW,
     height: origH,
     tag: flags.join(' · '),
+    desc,
+  };
+}
+
+function cosineSim(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot;
+}
+
+function selectDiverseBestN(items, targetN) {
+  // items: [{ filename, quality: { score, desc } | null }]
+  const n = Math.max(1, Math.min(items.length, targetN));
+  const pool = [...items].sort((a, b) => (b.quality?.score ?? 50) - (a.quality?.score ?? 50));
+  const kept = [];
+  const reasons = new Map();
+
+  if (pool.length) {
+    const first = pool.shift();
+    kept.push(first);
+    reasons.set(first.filename, 'Top Quality');
+  }
+
+  while (kept.length < n && pool.length) {
+    let bestIdx = 0;
+    let bestCombined = -Infinity;
+    let bestSim = 0;
+
+    for (let i = 0; i < pool.length; i++) {
+      const cand = pool[i];
+      const q = (cand.quality?.score ?? 50) / 100;
+      let maxSim = 0;
+      for (const k of kept) {
+        const sim = cosineSim(cand.quality?.desc, k.quality?.desc);
+        if (sim > maxSim) maxSim = sim;
+      }
+      // Balance quality (0..1) with diversity (penalize near-duplicates with sim > 0.78)
+      const dupPenalty = Math.max(0, maxSim - 0.55) * 1.45;
+      const combined = q * (1 - Math.min(0.85, dupPenalty));
+      if (combined > bestCombined) {
+        bestCombined = combined;
+        bestIdx = i;
+        bestSim = maxSim;
+      }
+    }
+
+    const chosen = pool.splice(bestIdx, 1)[0];
+    kept.push(chosen);
+    reasons.set(chosen.filename, bestSim < 0.78 ? 'Diverse' : 'Good');
+  }
+
+  for (const rest of pool) {
+    let maxSim = 0;
+    for (const k of kept) {
+      const sim = cosineSim(rest.quality?.desc, k.quality?.desc);
+      if (sim > maxSim) maxSim = sim;
+    }
+    const q = rest.quality?.score ?? 50;
+    reasons.set(rest.filename, maxSim >= 0.85 ? 'Near-Dup' : (q < 55 ? 'Weak' : 'Extra'));
+  }
+
+  return {
+    keepSet: new Set(kept.map(k => k.filename)),
+    reasons,
   };
 }
 
@@ -121,15 +211,19 @@ class FrigateFaceSwipesCard extends HTMLElement {
     this._faces = {};
     this._deck = [];
     this._history = [];
-    this._stats = { confirmed: 0, trashed: 0, reassigned: 0, replaced: 0, skipped: 0 };
-    this._mode = 'swipe'; // 'swipe' | 'groups' | 'library'
+    this._stats = { confirmed: 0, trashed: 0, reassigned: 0, pruned: 0, skipped: 0 };
+    this._mode = 'swipe'; // 'swipe' | 'curate' | 'groups'
     this._sort = 'newest';
     this._loading = false;
     this._error = '';
-    this._toast = '';
+    this._toast = null;
     this._showSnapshot = false;
     this._showPicker = false;
-    this._replaceTarget = null; // filename in predicted person's folder to replace
+    this._curatePerson = '';
+    this._curateKeepN = 8;
+    this._curateKeepSet = new Set();
+    this._curateReasons = new Map();
+    this._curateAnalyzing = false;
     this._selectedGroupFiles = new Set();
     this._imgCache = new Map();
     this._qualityCache = new Map();
@@ -222,24 +316,49 @@ class FrigateFaceSwipesCard extends HTMLElement {
     }
   }
 
-  async preloadPersonQuality(person) {
+  async runCurateAutoPick(person) {
+    if (!person) return;
     const files = Array.isArray(this._faces?.[person]) ? this._faces[person] : [];
-    const uncached = files.filter(f => !this._qualityCache.has(`clips/faces/${person}/${f}`));
-    if (!uncached.length) return;
-    await Promise.all(uncached.slice(0, 12).map(f => this.fetchAndAnalyze(`clips/faces/${person}/${f}`)));
+    if (!files.length) {
+      this._curateKeepSet = new Set();
+      this._curateReasons = new Map();
+      this.render();
+      return;
+    }
+    this._curateAnalyzing = true;
+    this.render();
+    await Promise.all(
+      files.map(f => this.fetchAndAnalyze(`clips/faces/${person}/${f}`))
+    );
+    const items = files.map(f => ({
+      filename: f,
+      quality: this._qualityCache.get(`clips/faces/${person}/${f}`) || null,
+    }));
+    const { keepSet, reasons } = selectDiverseBestN(items, this._curateKeepN);
+    this._curateKeepSet = keepSet;
+    this._curateReasons = reasons;
+    this._curateAnalyzing = false;
     this.render();
   }
 
-  getWeakestForPerson(person) {
+  async pruneUnkeptForPerson(person) {
     const files = Array.isArray(this._faces?.[person]) ? this._faces[person] : [];
-    let weakest = null;
-    for (const f of files) {
-      const q = this._qualityCache.get(`clips/faces/${person}/${f}`);
-      if (q && (!weakest || q.score < weakest.quality.score)) {
-        weakest = { filename: f, quality: q };
-      }
+    const toDelete = files.filter(f => !this._curateKeepSet.has(f));
+    if (!toDelete.length) return;
+    this._toast = this.makeToast(`Pruning ${toDelete.length} photo(s) from "${person}"...`);
+    this.render();
+    try {
+      await this.apiJson(`api/faces/${encodeURIComponent(person)}/delete`, {
+        method: 'POST',
+        body: JSON.stringify({ ids: toDelete }),
+      });
+      this._stats.pruned += toDelete.length;
+      this._faces[person] = files.filter(f => this._curateKeepSet.has(f));
+      this._toast = this.makeToast(`Kept ${this._faces[person].length} best diverse photos for "${person}"`);
+    } catch (err) {
+      this._toast = this.makeToast(`Prune error: ${err?.message || err}`);
     }
-    return weakest;
+    this.render();
   }
 
   async loadFaces() {
@@ -256,9 +375,8 @@ class FrigateFaceSwipesCard extends HTMLElement {
     }
     this._loading = false;
     this.render();
-    const top = this._deck[0];
-    if (top?.predicted && top.predicted !== 'unknown') {
-      this.preloadPersonQuality(top.predicted);
+    if (this._mode === 'curate' && this._curatePerson) {
+      this.runCurateAutoPick(this._curatePerson);
     }
   }
 
@@ -279,7 +397,14 @@ class FrigateFaceSwipesCard extends HTMLElement {
     this._deck = items;
     this._showSnapshot = false;
     this._showPicker = false;
-    this._replaceTarget = null;
+
+    const people = this.getPeopleNames();
+    if (!this._curatePerson || !people.includes(this._curatePerson)) {
+      const sortedByCount = [...people].sort(
+        (a, b) => (this._faces[b]?.length || 0) - (this._faces[a]?.length || 0)
+      );
+      this._curatePerson = sortedByCount[0] || '';
+    }
   }
 
   getPeopleNames() {
@@ -303,11 +428,6 @@ class FrigateFaceSwipesCard extends HTMLElement {
   advanceDeckCleanup() {
     this._showPicker = false;
     this._showSnapshot = false;
-    this._replaceTarget = null;
-    const nextTop = this._deck[0];
-    if (nextTop?.predicted && nextTop.predicted !== 'unknown') {
-      this.preloadPersonQuality(nextTop.predicted);
-    }
   }
 
   async confirmCurrent() {
@@ -319,43 +439,6 @@ class FrigateFaceSwipesCard extends HTMLElement {
       return;
     }
     await this.classifyItem(top, top.predicted, 'confirmed');
-  }
-
-  async replaceWeakestCurrent() {
-    const top = this._deck[0];
-    if (!top || !top.predicted || top.predicted === 'unknown') return;
-    const person = top.predicted;
-    const weakest = this.getWeakestForPerson(person);
-    const targetToReplace = this._replaceTarget || weakest?.filename;
-    if (!targetToReplace) {
-      await this.confirmCurrent();
-      return;
-    }
-    const oldQ = this._qualityCache.get(`clips/faces/${person}/${targetToReplace}`)?.score;
-    const newQ = this._qualityCache.get(`clips/faces/train/${top.filename}`)?.score;
-
-    this._deck.shift();
-    this.advanceDeckCleanup();
-    this.render();
-    try {
-      await this.apiJson(`api/faces/train/${encodeURIComponent(person)}/classify`, {
-        method: 'POST',
-        body: JSON.stringify({ training_file: top.filename }),
-      });
-      await this.apiJson(`api/faces/${encodeURIComponent(person)}/delete`, {
-        method: 'POST',
-        body: JSON.stringify({ ids: [targetToReplace] }),
-      });
-      this._stats.replaced++;
-      this._faces.train = (this._faces.train || []).filter(f => f !== top.filename);
-      this._faces[person] = (this._faces[person] || []).filter(f => f !== targetToReplace);
-      const qNote = oldQ != null && newQ != null ? ` (Q:${oldQ} → Q:${newQ})` : '';
-      this._toast = this.makeToast(`Replaced weak photo for "${person}"${qNote}`, top.filename);
-    } catch (err) {
-      this._deck.unshift(top);
-      this._toast = this.makeToast(`Replace error: ${err?.message || err}`, top.filename);
-    }
-    this.render();
   }
 
   async classifyItem(item, targetName, statKey = 'reassigned') {
@@ -499,7 +582,6 @@ class FrigateFaceSwipesCard extends HTMLElement {
     else if (e.key === 'ArrowLeft') { e.preventDefault(); this.trashCurrent(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); this._showPicker = !this._showPicker; this.render(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); this.skipCurrent(); }
-    else if (e.key.toLowerCase() === 'r') { e.preventDefault(); this.replaceWeakestCurrent(); }
     else if (e.key.toLowerCase() === 'z') { e.preventDefault(); this.undoLast(); }
   }
 
@@ -974,12 +1056,52 @@ class FrigateFaceSwipesCard extends HTMLElement {
           gap: 4px;
         }
         .tile.selected { border-color: #3b82f6; }
+        .tile.keep { border-color: #22c55e; background: rgba(34,197,94,0.08); }
+        .tile.prune { border-color: rgba(239,68,68,0.45); opacity: 0.68; }
         .tile img {
           width: 100%;
           aspect-ratio: 1;
           object-fit: cover;
           border-radius: 7px;
         }
+        .quick-pills {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .quick-pill {
+          background: var(--t-bg);
+          color: inherit;
+          border: 1px solid var(--t-border);
+          border-radius: 999px;
+          padding: 5px 10px;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          font-family: inherit;
+        }
+        .quick-pill:hover { border-color: #3b82f6; }
+        .curate-bar {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          align-items: center;
+          justify-content: space-between;
+          background: var(--t-surface);
+          border: 1px solid var(--t-border);
+          border-radius: 12px;
+          padding: 10px;
+        }
+        .curate-badge {
+          font-size: 10px;
+          font-weight: 800;
+          padding: 2px 6px;
+          border-radius: 5px;
+          text-transform: uppercase;
+          letter-spacing: 0.03em;
+        }
+        .curate-badge.keep { background: rgba(34,197,94,0.2); color: #4ade80; }
+        .curate-badge.prune { background: rgba(239,68,68,0.2); color: #f87171; }
         .empty {
           text-align: center;
           padding: 36px 16px;
@@ -995,16 +1117,16 @@ class FrigateFaceSwipesCard extends HTMLElement {
           </div>
           <div class="mode-tabs">
             <button class="mode-tab ${this._mode === 'swipe' ? 'active' : ''}" data-mode="swipe">Swipe (${this._deck.length})</button>
+            <button class="mode-tab ${this._mode === 'curate' ? 'active' : ''}" data-mode="curate">Curate (${people.length})</button>
             <button class="mode-tab ${this._mode === 'groups' ? 'active' : ''}" data-mode="groups">Groups</button>
-            <button class="mode-tab ${this._mode === 'library' ? 'active' : ''}" data-mode="library">Library (${people.length})</button>
           </div>
         </div>
 
         <div class="stats-bar">
           <div class="stat-pills">
             <span class="stat-pill">✓ ${this._stats.confirmed}</span>
-            <span class="stat-pill">⇄ ${this._stats.replaced}</span>
             <span class="stat-pill">✎ ${this._stats.reassigned}</span>
+            <span class="stat-pill">✂ ${this._stats.pruned}</span>
             <span class="stat-pill">✕ ${this._stats.trashed}</span>
           </div>
           <div style="display:flex;gap:6px;align-items:center;">
@@ -1027,8 +1149,8 @@ class FrigateFaceSwipesCard extends HTMLElement {
         ${this._error ? `<div class="err">${escapeHtml(this._error)}</div>` : ''}
 
         ${this._mode === 'swipe' ? this.renderSwipeMode(top, next, people) : ''}
+        ${this._mode === 'curate' ? this.renderCurateMode(people) : ''}
         ${this._mode === 'groups' ? this.renderGroupsMode(people) : ''}
-        ${this._mode === 'library' ? this.renderLibraryMode(people) : ''}
       </ha-card>
     `;
 
@@ -1039,29 +1161,15 @@ class FrigateFaceSwipesCard extends HTMLElement {
     if (!top) {
       return `
         <div class="empty">
-          <strong>Queue is empty!</strong><br/>
-          All pending faces in Frigate's train queue have been reviewed.
+          <strong>Assign queue is empty!</strong><br/>
+          Switch to <strong>Curate</strong> to pick the best diverse shots for each person.
         </div>
       `;
     }
     const isUnknown = !top.predicted || top.predicted === 'unknown';
-    const allRefs = !isUnknown && Array.isArray(this._faces?.[top.predicted])
-      ? this._faces[top.predicted]
-      : [];
-    // Sort existing photos so weakest quality appears first for easy replacement
-    const sortedRefs = [...allRefs].sort((a, b) => {
-      const qa = this._qualityCache.get(`clips/faces/${top.predicted}/${a}`)?.score ?? 999;
-      const qb = this._qualityCache.get(`clips/faces/${top.predicted}/${b}`)?.score ?? 999;
-      return qa - qb;
-    }).slice(0, 4);
-
-    const weakest = !isUnknown ? this.getWeakestForPerson(top.predicted) : null;
-    const replaceFile = this._replaceTarget || weakest?.filename || null;
-    const replaceQ = replaceFile
-      ? this._qualityCache.get(`clips/faces/${top.predicted}/${replaceFile}`)?.score
-      : null;
     const candQ = this._qualityCache.get(`clips/faces/train/${top.filename}`)?.score;
     const tier = scoreTier(top.score);
+    const quickPeople = people.filter(p => p !== top.predicted).slice(0, 5);
 
     return `
       <div class="deck-stage">
@@ -1074,7 +1182,7 @@ class FrigateFaceSwipesCard extends HTMLElement {
           <div class="swipe-card" id="active-card">
             <div class="stamp confirm" id="stamp-confirm">CONFIRM</div>
             <div class="stamp trash" id="stamp-trash">TRASH</div>
-            <div class="stamp reassign" id="stamp-reassign">REASSIGN</div>
+            <div class="stamp reassign" id="stamp-reassign">WHO?</div>
             <div class="hero-wrap">
               ${!this._showSnapshot ? `<span class="q-badge hero-q ${candQ != null ? `tier-${qualityTier(candQ)}` : ''}" id="hero-q-badge">${candQ != null ? `Q:${candQ}` : 'Q:…'}</span>` : ''}
               ${this._showSnapshot && top.eventId
@@ -1084,34 +1192,15 @@ class FrigateFaceSwipesCard extends HTMLElement {
             </div>
             <div class="card-body">
               <div class="pred-row">
-                <span class="pred-title">${isUnknown ? 'Unknown Person' : `Is this ${escapeHtml(top.predicted)}?`}</span>
+                <span class="pred-title">${isUnknown ? 'Who is this?' : `Is this ${escapeHtml(top.predicted)}?`}</span>
                 <span class="score-pill tier-${tier}">${formatPct(top.score)}</span>
               </div>
-              ${sortedRefs.length ? `
-                <div class="ref-strip">
-                  <span style="font-size:11px;color:var(--t-muted);">
-                    Weakest / existing for ${escapeHtml(top.predicted)} (tap one to target replace):
-                  </span>
-                  <div class="ref-imgs">
-                    ${sortedRefs.map((rf, idx) => {
-                      const path = `clips/faces/${top.predicted}/${rf}`;
-                      const rq = this._qualityCache.get(path)?.score;
-                      const isTarget = replaceFile === rf;
-                      return `
-                        <div class="ref-item ${isTarget ? 'replace-selected' : ''}" data-pick-replace="${escapeHtml(rf)}" title="Click to select for replacement">
-                          <img data-auth-img="${escapeHtml(path)}" data-q-target="ref-q-${idx}" alt="${escapeHtml(top.predicted)}" />
-                          <span class="q-badge ${rq != null ? `tier-${qualityTier(rq)}` : ''}" id="ref-q-${idx}">${rq != null ? `Q:${rq}` : '…'}</span>
-                        </div>
-                      `;
-                    }).join('')}
-                  </div>
-                  ${replaceFile ? `
-                    <button class="replace-btn" id="btn-replace-weakest">
-                      ⇄ Replace Selected (${replaceQ != null ? `Q:${replaceQ}` : 'weakest'} → ${candQ != null ? `Q:${candQ}` : 'new'})
-                    </button>
-                  ` : ''}
+              ${quickPeople.length ? `
+                <div class="quick-pills">
+                  ${quickPeople.map(p => `<button class="quick-pill" data-pick-person="${escapeHtml(p)}">${escapeHtml(p)}</button>`).join('')}
+                  <button class="quick-pill" id="btn-more-people" style="color:#60a5fa;">+ More…</button>
                 </div>
-              ` : `<div style="font-size:12px;color:var(--t-muted);">Swipe right or tap Confirm to label, or Trash if blurry/bad.</div>`}
+              ` : `<div style="font-size:12px;color:var(--t-muted);">Swipe right to confirm, left to trash, or tap ✎ to pick a person.</div>`}
             </div>
           </div>
         </div>
@@ -1119,11 +1208,11 @@ class FrigateFaceSwipesCard extends HTMLElement {
         <div class="actions">
           <button class="act-btn small" id="btn-undo" title="Undo skip (Z)">↺</button>
           <button class="act-btn trash" id="btn-trash" title="Trash bad crop (←)">✕</button>
-          <button class="act-btn reassign" id="btn-reassign" title="Reassign person (↑)">✎</button>
+          <button class="act-btn reassign" id="btn-reassign" title="Pick person (↑)">✎</button>
           <button class="act-btn small" id="btn-skip" title="Skip for now (↓)">↷</button>
-          <button class="act-btn confirm" id="btn-confirm" title="Confirm & Add (→)">✓</button>
+          <button class="act-btn confirm" id="btn-confirm" title="Confirm (→)">✓</button>
         </div>
-        <div class="kbd-hint">Swipe or keys: ← Trash · → Add · R Replace weakest · ↑ Reassign · ↓ Skip · Z Undo</div>
+        <div class="kbd-hint">Swipe or keys: ← Trash · → Confirm · ↑ Pick Person · ↓ Skip · Z Undo</div>
 
         ${this._showPicker ? `
           <div class="picker-backdrop" id="picker-backdrop">
@@ -1205,43 +1294,77 @@ class FrigateFaceSwipesCard extends HTMLElement {
     `;
   }
 
-  renderLibraryMode(people) {
+  renderCurateMode(people) {
     if (!people.length) {
       return `<div class="empty">No registered people found in Frigate.</div>`;
     }
-    return people.map((person, pIdx) => {
-      const files = this._faces[person] || [];
-      return `
-        <div class="group-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <strong>${escapeHtml(person)}</strong>
-            <span style="font-size:12px;color:var(--t-muted);">${files.length} image${files.length === 1 ? '' : 's'}</span>
-          </div>
-          <div class="tile-grid">
-            ${files.map((file, fIdx) => {
-              const path = `clips/faces/${person}/${file}`;
-              const q = this._qualityCache.get(path)?.score;
-              const qId = `lib-q-${pIdx}-${fIdx}`;
-              return `
-                <div class="tile" style="cursor:default;">
-                  <div style="position:relative;">
-                    <img data-auth-img="${escapeHtml(path)}" data-q-target="${qId}" alt="${escapeHtml(person)}" />
-                    <span class="q-badge ${q != null ? `tier-${qualityTier(q)}` : ''}" id="${qId}" style="position:absolute;bottom:4px;right:4px;">${q != null ? `Q:${q}` : '…'}</span>
-                  </div>
-                  <div style="display:flex;gap:4px;">
-                    <select data-lib-move-from="${escapeHtml(person)}" data-lib-move-file="${escapeHtml(file)}" style="flex:1;min-width:0;padding:3px;">
-                      <option value="">Move...</option>
-                      ${people.filter(p => p !== person).map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('')}
-                    </select>
-                    <button class="btn danger" style="padding:3px 6px;" data-lib-del-person="${escapeHtml(person)}" data-lib-del-file="${escapeHtml(file)}">✕</button>
-                  </div>
-                </div>
-              `;
-            }).join('')}
-          </div>
+    const person = people.includes(this._curatePerson) ? this._curatePerson : people[0];
+    const files = Array.isArray(this._faces?.[person]) ? this._faces[person] : [];
+    const hasCuratePlan = this._curateKeepSet.size > 0 || files.length === 0;
+    const keptCount = files.filter(f => this._curateKeepSet.has(f)).length;
+    const pruneCount = hasCuratePlan ? Math.max(0, files.length - keptCount) : 0;
+
+    // Sort kept photos first, then prune candidates by quality
+    const orderedFiles = [...files].sort((a, b) => {
+      if (hasCuratePlan) {
+        const ak = this._curateKeepSet.has(a) ? 0 : 1;
+        const bk = this._curateKeepSet.has(b) ? 0 : 1;
+        if (ak !== bk) return ak - bk;
+      }
+      const qa = this._qualityCache.get(`clips/faces/${person}/${a}`)?.score ?? 0;
+      const qb = this._qualityCache.get(`clips/faces/${person}/${b}`)?.score ?? 0;
+      return qb - qa;
+    });
+
+    return `
+      <div class="curate-bar">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <select id="curate-person-sel">
+            ${people.map(p => `<option value="${escapeHtml(p)}" ${p === person ? 'selected' : ''}>${escapeHtml(p)} (${(this._faces[p] || []).length})</option>`).join('')}
+          </select>
+          <label style="font-size:12px;display:flex;align-items:center;gap:5px;">
+            Keep best:
+            <select id="curate-n-sel">
+              ${[3, 5, 8, 10, 12, 15, 20].map(n => `<option value="${n}" ${this._curateKeepN === n ? 'selected' : ''}>${n}</option>`).join('')}
+            </select>
+          </label>
+          <button class="btn primary" id="btn-curate-auto">${this._curateAnalyzing ? 'Analyzing…' : 'Auto-Pick Diverse'}</button>
         </div>
-      `;
-    }).join('');
+        ${pruneCount > 0 ? `
+          <button class="btn danger" id="btn-curate-prune">✂ Prune ${pruneCount} Unkept</button>
+        ` : ''}
+      </div>
+      <div style="font-size:12px;color:var(--t-muted);">
+        Picks the sharpest, best-lit <strong>${this._curateKeepN}</strong> shots while penalizing near-duplicates. Tap any tile to toggle Keep/Prune.
+      </div>
+      ${files.length === 0 ? `<div class="empty">No photos registered for ${escapeHtml(person)}.</div>` : `
+        <div class="tile-grid">
+          ${orderedFiles.map((file, idx) => {
+            const path = `clips/faces/${person}/${file}`;
+            const q = this._qualityCache.get(path)?.score;
+            const qId = `cur-q-${idx}`;
+            const isKeep = !hasCuratePlan || this._curateKeepSet.has(file);
+            const reason = this._curateReasons.get(file) || '';
+            return `
+              <div class="tile ${hasCuratePlan ? (isKeep ? 'keep' : 'prune') : ''}" data-curate-toggle="${escapeHtml(file)}">
+                <div style="position:relative;">
+                  <img data-auth-img="${escapeHtml(path)}" data-q-target="${qId}" alt="${escapeHtml(person)}" />
+                  <span class="q-badge ${q != null ? `tier-${qualityTier(q)}` : ''}" id="${qId}" style="position:absolute;bottom:4px;right:4px;">${q != null ? `Q:${q}` : '…'}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:4px;">
+                  <span class="curate-badge ${isKeep ? 'keep' : 'prune'}">${isKeep ? 'Keep' : 'Prune'}</span>
+                  <span style="font-size:10px;color:var(--t-muted);">${escapeHtml(reason)}</span>
+                </div>
+                <select data-lib-move-from="${escapeHtml(person)}" data-lib-move-file="${escapeHtml(file)}" style="width:100%;padding:3px;font-size:11px;">
+                  <option value="">Move to...</option>
+                  ${people.filter(p => p !== person).map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('')}
+                </select>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      `}
+    `;
   }
 
   bindEvents(top) {
@@ -1255,6 +1378,10 @@ class FrigateFaceSwipesCard extends HTMLElement {
     root.querySelectorAll('.mode-tab').forEach(btn => {
       btn.addEventListener('click', () => {
         this._mode = btn.dataset.mode;
+        if (this._mode === 'curate' && this._curatePerson) {
+          this.runCurateAutoPick(this._curatePerson);
+          return;
+        }
         this.render();
       });
     });
@@ -1267,7 +1394,6 @@ class FrigateFaceSwipesCard extends HTMLElement {
 
     root.getElementById('btn-refresh')?.addEventListener('click', () => this.loadFaces());
     root.getElementById('btn-confirm')?.addEventListener('click', () => this.confirmCurrent());
-    root.getElementById('btn-replace-weakest')?.addEventListener('click', () => this.replaceWeakestCurrent());
     root.getElementById('btn-trash')?.addEventListener('click', () => this.trashCurrent());
     root.getElementById('btn-skip')?.addEventListener('click', () => this.skipCurrent());
     root.getElementById('btn-undo')?.addEventListener('click', () => this.undoLast());
@@ -1275,14 +1401,35 @@ class FrigateFaceSwipesCard extends HTMLElement {
       this._showPicker = !this._showPicker;
       this.render();
     });
+    root.getElementById('btn-more-people')?.addEventListener('click', () => {
+      this._showPicker = true;
+      this.render();
+    });
     root.getElementById('btn-snap-toggle')?.addEventListener('click', () => {
       this._showSnapshot = !this._showSnapshot;
       this.render();
     });
 
-    root.querySelectorAll('[data-pick-replace]').forEach(el => {
-      el.addEventListener('click', () => {
-        this._replaceTarget = el.dataset.pickReplace;
+    root.getElementById('curate-person-sel')?.addEventListener('change', (e) => {
+      this._curatePerson = e.target.value;
+      this.runCurateAutoPick(this._curatePerson);
+    });
+    root.getElementById('curate-n-sel')?.addEventListener('change', (e) => {
+      this._curateKeepN = Number(e.target.value) || 8;
+      this.runCurateAutoPick(this._curatePerson);
+    });
+    root.getElementById('btn-curate-auto')?.addEventListener('click', () => {
+      this.runCurateAutoPick(this._curatePerson);
+    });
+    root.getElementById('btn-curate-prune')?.addEventListener('click', () => {
+      this.pruneUnkeptForPerson(this._curatePerson);
+    });
+    root.querySelectorAll('.tile[data-curate-toggle]').forEach(tile => {
+      tile.addEventListener('click', (e) => {
+        if (e.target.closest('select')) return;
+        const f = tile.dataset.curateToggle;
+        if (this._curateKeepSet.has(f)) this._curateKeepSet.delete(f);
+        else this._curateKeepSet.add(f);
         this.render();
       });
     });
