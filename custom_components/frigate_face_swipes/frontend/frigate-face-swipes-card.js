@@ -288,8 +288,15 @@ class FrigateFaceSwipesCard extends HTMLElement {
       .sort((a, b) => a.localeCompare(b));
   }
 
-  setToast(msg) {
-    this._toast = msg;
+  makeToast(text, trainFilename = null) {
+    const thumbUrl = trainFilename
+      ? (this._imgCache.get(`clips/faces/train/${trainFilename}`) || null)
+      : null;
+    return { text, thumbUrl };
+  }
+
+  setToast(msg, trainFilename = null) {
+    this._toast = typeof msg === 'string' ? this.makeToast(msg, trainFilename) : msg;
     this.render();
   }
 
@@ -343,10 +350,10 @@ class FrigateFaceSwipesCard extends HTMLElement {
       this._faces.train = (this._faces.train || []).filter(f => f !== top.filename);
       this._faces[person] = (this._faces[person] || []).filter(f => f !== targetToReplace);
       const qNote = oldQ != null && newQ != null ? ` (Q:${oldQ} → Q:${newQ})` : '';
-      this._toast = `Replaced ${targetToReplace} for "${person}"${qNote}`;
+      this._toast = this.makeToast(`Replaced weak photo for "${person}"${qNote}`, top.filename);
     } catch (err) {
       this._deck.unshift(top);
-      this._toast = `Replace error: ${err?.message || err}`;
+      this._toast = this.makeToast(`Replace error: ${err?.message || err}`, top.filename);
     }
     this.render();
   }
@@ -365,10 +372,10 @@ class FrigateFaceSwipesCard extends HTMLElement {
       this._stats[statKey]++;
       this._faces.train = (this._faces.train || []).filter(f => f !== item.filename);
       if (!Array.isArray(this._faces[name])) this._faces[name] = [];
-      this._toast = `Saved to "${name}"`;
+      this._toast = this.makeToast(`Saved to "${name}"`, item.filename);
     } catch (err) {
       this._deck.unshift(item);
-      this._toast = `Error: ${err?.message || err}`;
+      this._toast = this.makeToast(`Error: ${err?.message || err}`, item.filename);
     }
     this.render();
   }
@@ -386,20 +393,22 @@ class FrigateFaceSwipesCard extends HTMLElement {
       });
       this._stats.trashed++;
       this._faces.train = (this._faces.train || []).filter(f => f !== top.filename);
-      this._toast = 'Trashed blurry/bad face crop';
+      this._toast = this.makeToast('Trashed bad crop', top.filename);
     } catch (err) {
       this._deck.unshift(top);
-      this._toast = `Delete error: ${err?.message || err}`;
+      this._toast = this.makeToast(`Delete error: ${err?.message || err}`, top.filename);
     }
     this.render();
   }
 
   skipCurrent() {
-    const top = this._deck.shift();
+    const top = this._deck[0];
     if (!top) return;
+    this._deck.shift();
     this._deck.push(top);
     this._history.push({ type: 'skip', item: top });
     this._stats.skipped++;
+    this._toast = this.makeToast('Skipped for later', top.filename);
     this.advanceDeckCleanup();
     this.render();
   }
@@ -414,7 +423,7 @@ class FrigateFaceSwipesCard extends HTMLElement {
       this._deck = this._deck.filter(x => x.filename !== last.item.filename);
       this._deck.unshift(last.item);
       this._stats.skipped = Math.max(0, this._stats.skipped - 1);
-      this._toast = 'Restored skipped face';
+      this._toast = this.makeToast('Restored skipped face', last.item.filename);
       this.render();
     }
   }
@@ -584,10 +593,29 @@ class FrigateFaceSwipesCard extends HTMLElement {
         }
         .toast {
           font-size: 12px;
-          padding: 8px 12px;
+          padding: 6px 10px;
           border-radius: 10px;
-          background: rgba(37, 99, 235, 0.15);
+          background: rgba(37, 99, 235, 0.14);
           border: 1px solid rgba(37, 99, 235, 0.35);
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .toast-thumb {
+          width: 28px;
+          height: 28px;
+          border-radius: 6px;
+          object-fit: cover;
+          flex-shrink: 0;
+          background: #0d0f13;
+        }
+        .toast-tag {
+          font-size: 10px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          color: #60a5fa;
+          flex-shrink: 0;
         }
         .err {
           font-size: 13px;
@@ -601,13 +629,31 @@ class FrigateFaceSwipesCard extends HTMLElement {
           display: flex;
           flex-direction: column;
           align-items: center;
-          gap: 14px;
+          gap: 12px;
         }
         .card-stack {
           position: relative;
           width: 100%;
           max-width: 390px;
-          min-height: 410px;
+        }
+        button { touch-action: manipulation; }
+        @media (max-width: 600px), (hover: none) {
+          .kbd-hint { display: none; }
+        }
+        @media (max-width: 600px) {
+          ha-card { padding: 10px; gap: 8px; border-radius: 14px; }
+          .brand { font-size: 14px; }
+          .brand-sub { display: none; }
+          .mode-tab { padding: 5px 9px; font-size: 11px; }
+          .stats-bar { gap: 6px; font-size: 11px; }
+          .stat-pill { padding: 2px 7px; }
+          .hero-wrap { aspect-ratio: auto; height: min(290px, 34vh); }
+          .card-body { padding: 10px; gap: 7px; }
+          .pred-title { font-size: 16px; }
+          .ref-imgs { gap: 4px; }
+          .actions { gap: 10px; }
+          .act-btn { width: 50px; height: 50px; font-size: 20px; }
+          .act-btn.small { width: 38px; height: 38px; font-size: 15px; }
         }
         .swipe-card {
           position: relative;
@@ -945,7 +991,7 @@ class FrigateFaceSwipesCard extends HTMLElement {
         <div class="topbar">
           <div class="brand">
             <span class="pill-badge">Face Swipes</span>
-            <span>Frigate Face Trainer</span>
+            <span class="brand-sub">Frigate Face Trainer</span>
           </div>
           <div class="mode-tabs">
             <button class="mode-tab ${this._mode === 'swipe' ? 'active' : ''}" data-mode="swipe">Swipe (${this._deck.length})</button>
@@ -957,7 +1003,7 @@ class FrigateFaceSwipesCard extends HTMLElement {
         <div class="stats-bar">
           <div class="stat-pills">
             <span class="stat-pill">✓ ${this._stats.confirmed}</span>
-            <span class="stat-pill">⇄ ${this._stats.replaced} replaced</span>
+            <span class="stat-pill">⇄ ${this._stats.replaced}</span>
             <span class="stat-pill">✎ ${this._stats.reassigned}</span>
             <span class="stat-pill">✕ ${this._stats.trashed}</span>
           </div>
@@ -971,7 +1017,13 @@ class FrigateFaceSwipesCard extends HTMLElement {
           </div>
         </div>
 
-        ${this._toast ? `<div class="toast">${escapeHtml(this._toast)}</div>` : ''}
+        ${this._toast ? `
+          <div class="toast">
+            ${this._toast.thumbUrl ? `<img class="toast-thumb" src="${escapeHtml(this._toast.thumbUrl)}" alt="Last face" />` : ''}
+            <span class="toast-tag">Last:</span>
+            <span>${escapeHtml(typeof this._toast === 'string' ? this._toast : this._toast.text)}</span>
+          </div>
+        ` : ''}
         ${this._error ? `<div class="err">${escapeHtml(this._error)}</div>` : ''}
 
         ${this._mode === 'swipe' ? this.renderSwipeMode(top, next, people) : ''}
@@ -1382,6 +1434,7 @@ class FrigateFaceSwipesPanel extends HTMLElement {
       this.shadowRoot.innerHTML = `
         <style>
           :host { display: block; padding: 16px; max-width: 960px; margin: 0 auto; }
+          @media (max-width: 600px) { :host { padding: 6px; } }
         </style>
         <frigate-face-swipes-card id="card"></frigate-face-swipes-card>
       `;
